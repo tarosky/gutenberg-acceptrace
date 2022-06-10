@@ -1,0 +1,14 @@
+{
+  "C_Cpp.formatting": "Disabled",
+  "C_Cpp.default.systemIncludePath": [
+    "config/linux-headers/include",
+    "config/linux-headers/arch/x86/include"
+  ],
+  "C_Cpp.errorSquiggles": "Disabled",
+  "files.associations": {
+    "unistd_64.h": "c",
+    "sched.h": "c",
+    "mount.h": "c",
+    "ptrace.h": "c"
+  }
+}

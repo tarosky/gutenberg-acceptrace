@@ -1,3 +1,6 @@
+//go:build linux
+// +build linux
+
 package main
 
 import (
@@ -33,12 +36,6 @@ func main() {
 			Usage:    "Path to syscall header file <asm/unistd_64.h>.",
 			Required: true,
 		},
-		&cli.IntFlag{
-			Name:    "debug",
-			Aliases: []string{"d"},
-			Value:   0,
-			Usage:   "Enable debug output: bcc.DEBUG_SOURCE: 8, bcc.DEBUG_PREPROCESSOR: 4.",
-		},
 		&cli.BoolFlag{
 			Name:    "quit",
 			Aliases: []string{"q"},
@@ -51,9 +48,11 @@ func main() {
 		log := createLogger()
 		defer log.Sync()
 
+		stopper := make(chan os.Signal, 1)
+		signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
+
 		cfg := &trace.Config{
 			SyscallHeader: c.Path("syscall-header"),
-			BpfDebug:      c.Uint("debug"),
 			Quit:          c.Bool("quit"),
 			Log:           log,
 		}
@@ -70,10 +69,16 @@ func main() {
 		}()
 
 		go func() {
-			for {
-				if _, ok := <-eventCh; !ok {
-					return
-				}
+			for ev := range eventCh {
+				log.Debug("line",
+					zap.String("syscall", ev.Syscall),
+					zap.Uint32("pid", ev.Pid),
+					zap.Int32("fd", ev.FD),
+					zap.Int32("ret", ev.Ret),
+					zap.Uint64("start_time", ev.StartTime),
+					zap.Uint64("end_time", ev.EndTime),
+					zap.String("comm", ev.Comm),
+					zap.String("path", ev.Path))
 			}
 		}()
 

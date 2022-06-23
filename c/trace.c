@@ -1,27 +1,51 @@
-#include <asm/unistd_64.h>
-#include <linux/fs.h>
-#include <linux/sched.h>
+// +build ignore
 
-struct data_t {
+#include "asm/unistd_64.h"
+#include "vmlinux.h"
+
+#include <bpf/bpf_core_read.h>
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_tracing.h>
+
+#define AT_FDCWD -100
+#define PATH_MAX 1024 // 4096
+#define TASK_COMM_LEN 16
+
+char __license[] SEC("license") = "Dual MIT/GPL";
+
+struct event {
   u32 syscall;
-  u32 debug;
-  u64 pid; // PID as in the userspace term (i.e. task->tgid in kernel)
+  u32 pid;
+  s32 fd;
+  s32 ret;
   u64 start_time;
   u64 end_time;
-  char comm[TASK_COMM_LEN];
+  u8 comm[TASK_COMM_LEN];
+  u8 path[PATH_MAX];
+};
 
-  char path[PATH_MAX];
-} __attribute__((__packed__)) __attribute__((__aligned__(8)));
+struct {
+  __uint(type, BPF_MAP_TYPE_RINGBUF);
+  __uint(max_entries, 1 << 24);
+} events SEC(".maps");
 
-BPF_PERF_OUTPUT(events);
-BPF_HASH(evt_syscall, u64, struct data_t);
-BPF_PERCPU_ARRAY(store, struct data_t, 1);
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, int);
+  __type(value, struct event);
+} store SEC(".maps");
 
-static __always_inline int is_equal8(const void *s1, const void *s2, int wlen) {
+// Force emitting struct event into the ELF.
+const struct event *unused __attribute__((unused));
+
+const volatile char phpfpm_comm[TASK_COMM_LEN] = "code";
+
+static int is_task_comm_equal(const void *s1, const void *s2) {
   u64 *ss1 = (u64 *)s1;
   u64 *ss2 = (u64 *)s2;
 #pragma unroll
-  for (int i = 0; i < wlen; i++) {
+  for (int i = 0; i < TASK_COMM_LEN / 8; i++) {
     if (ss1[i] != ss2[i]) {
       return 0;
     }
@@ -29,223 +53,79 @@ static __always_inline int is_equal8(const void *s1, const void *s2, int wlen) {
   return 1;
 }
 
-static __always_inline int is_equal1(const void *s1, const void *s2, int blen) {
-  char *ss1 = (char *)s1;
-  char *ss2 = (char *)s2;
-#pragma unroll
-  for (int i = 0; i < blen; i++) {
-    if (ss1[i] != ss2[i]) {
-      return 0;
-    }
+static struct event *get_event(u32 syscall) {
+  char comm[TASK_COMM_LEN];
+  bpf_get_current_comm(comm, TASK_COMM_LEN);
+  if (!is_task_comm_equal(comm, (void *)phpfpm_comm)) {
+    return NULL;
   }
-  return 1;
+
+  const int key = 0;
+  struct event *t = bpf_map_lookup_elem(&store, &key);
+  if (t == NULL) {
+    return NULL;
+  }
+
+  t->start_time = bpf_ktime_get_ns();
+  t->syscall = syscall;
+  bpf_get_current_comm(&t->comm, TASK_COMM_LEN);
+
+  u64 id = bpf_get_current_pid_tgid();
+  t->pid = id >> 32;
+
+  return t;
 }
 
-static __always_inline void copy_command_name(char *name) {
-  bpf_get_current_comm(name, TASK_COMM_LEN);
-}
-
-static __always_inline void copy_time(u64 *time) { *time = bpf_ktime_get_ns(); }
-
-static __always_inline struct data_t *get_data(u32 syscall) {
-  int zero = 0;
-  struct data_t *data = store.lookup(&zero);
-  if (data == NULL) {
+static int submit_event(struct pt_regs *regs) {
+  const int key = 0;
+  struct event *t = bpf_map_lookup_elem(&store, &key);
+  if (t == NULL) {
     return 0;
   }
-  data->syscall = syscall;
-  return data;
-}
 
-static __always_inline int enter_common(struct pt_regs *ctx, u32 syscall) {
-  struct data_t *data = get_data(syscall);
-  if (data == NULL) {
+  u64 id = bpf_get_current_pid_tgid();
+  u32 pid = id >> 32;
+  if (pid != t->pid) {
     return 0;
   }
-  u64 ptg_id = bpf_get_current_pid_tgid();
 
-  // Copy command name
-  //
-  copy_command_name(data->comm);
-
-  // Copy pid
-  //
-  data->pid = ptg_id >> 32;
-
-  // Copy start time
-  //
-  copy_time(&data->start_time);
-
-  evt_syscall.update(&ptg_id, data);
-
-  return 0;
-}
-
-static __always_inline int return_common(struct pt_regs *ctx) {
-  u64 ptg_id = bpf_get_current_pid_tgid();
-  struct data_t *data = evt_syscall.lookup(&ptg_id);
-  if (data == NULL) {
-    return 0;
-  }
-  evt_syscall.delete(&ptg_id);
-
-  // Copy start time
-  //
-  copy_time(&data->end_time);
-
-  data->debug = 0;
-  events.perf_submit(ctx, data, sizeof(struct data_t));
+  t->end_time = bpf_ktime_get_ns();
+  bpf_probe_read_kernel(&t->ret, sizeof(t->ret), (void *)PT_REGS_RC_CORE(regs));
+  bpf_ringbuf_output(&events, t, sizeof(struct event), 0);
 
   return 0;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 
-int enter___syscall___unlink(struct pt_regs *ctx, const char __user *pathname) {
-  return enter_common(ctx, __NR_unlink);
+SEC("fentry/__x64_sys_openat")
+int BPF_PROG(sys_openat, struct pt_regs *regs) {
+  struct event *t = get_event(__NR_openat);
+  if (t == NULL) {
+    return 0;
+  }
+
+  t->fd = PT_REGS_PARM1_CORE(regs);
+  bpf_probe_read_user(t->path, sizeof(t->path), (void *)PT_REGS_PARM2_CORE(regs));
+
+  return 0;
 }
 
-int enter___syscall___unlinkat(struct pt_regs *ctx, int dfd, const char __user *pathname,
-                               int flag) {
-  return enter_common(ctx, __NR_unlinkat);
+SEC("fexit/__x64_sys_openat")
+int BPF_PROG(syse_openat, struct pt_regs *regs) { return submit_event(regs); }
+
+SEC("fentry/__x64_sys_close")
+int BPF_PROG(sys_close, struct pt_regs *regs) {
+  struct event *t = get_event(__NR_close);
+  if (t == NULL) {
+    return 0;
+  }
+
+  t->fd = PT_REGS_PARM1_CORE(regs);
+  t->path[0] = '\0';
+
+  return 0;
 }
 
-int return___syscall___unlink(struct pt_regs *ctx) { return return_common(ctx); }
-int return___syscall___unlinkat(struct pt_regs *ctx) { return return_common(ctx); }
-
-////////////////////////////////////////////////////////////////////////////////
-
-int enter___syscall___rename(struct pt_regs *ctx, const char __user *oldname,
-                             const char __user *newname) {
-  return enter_common(ctx, __NR_rename);
-}
-
-int enter___syscall___renameat(struct pt_regs *ctx, int olddfd,
-                               const char __user *oldname, int newdfd,
-                               const char __user *newname) {
-  return enter_common(ctx, __NR_renameat);
-}
-
-int enter___syscall___renameat2(struct pt_regs *ctx, int olddfd,
-                                const char __user *oldname, int newdfd,
-                                const char __user *newname, unsigned int flags) {
-  return enter_common(ctx, __NR_renameat2);
-}
-
-int return___syscall___rename(struct pt_regs *ctx) { return return_common(ctx); }
-int return___syscall___renameat(struct pt_regs *ctx) { return return_common(ctx); }
-int return___syscall___renameat2(struct pt_regs *ctx) { return return_common(ctx); }
-
-////////////////////////////////////////////////////////////////////////////////
-
-int enter___syscall___chmod(struct pt_regs *ctx, const char __user *filename,
-                            umode_t mode) {
-  return enter_common(ctx, __NR_chmod);
-}
-
-int enter___syscall___fchmod(struct pt_regs *ctx, unsigned int fd, umode_t mode) {
-  return enter_common(ctx, __NR_fchmod);
-}
-
-int enter___syscall___fchmodat(struct pt_regs *ctx, int dfd, const char __user *filename,
-                               umode_t mode) {
-  return enter_common(ctx, __NR_fchmodat);
-}
-
-int return___syscall___chmod(struct pt_regs *ctx) { return return_common(ctx); }
-int return___syscall___fchmod(struct pt_regs *ctx) { return return_common(ctx); }
-int return___syscall___fchmodat(struct pt_regs *ctx) { return return_common(ctx); }
-
-////////////////////////////////////////////////////////////////////////////////
-
-int enter___syscall___chown(struct pt_regs *ctx, const char __user *filename, uid_t user,
-                            gid_t group) {
-  return enter_common(ctx, __NR_chown);
-}
-
-int enter___syscall___fchown(struct pt_regs *ctx, unsigned int fd, uid_t user,
-                             gid_t group) {
-  return enter_common(ctx, __NR_fchown);
-}
-
-int enter___syscall___fchownat(struct pt_regs *ctx, int dfd, const char __user *filename,
-                               uid_t user, gid_t group, int flag) {
-  return enter_common(ctx, __NR_fchownat);
-}
-
-int enter___syscall___lchown(struct pt_regs *ctx, const char __user *filename, uid_t user,
-                             gid_t group) {
-  return enter_common(ctx, __NR_lchown);
-}
-
-int return___syscall___chown(struct pt_regs *ctx) { return return_common(ctx); }
-int return___syscall___fchown(struct pt_regs *ctx) { return return_common(ctx); }
-int return___syscall___fchownat(struct pt_regs *ctx) { return return_common(ctx); }
-int return___syscall___lchown(struct pt_regs *ctx) { return return_common(ctx); }
-
-////////////////////////////////////////////////////////////////////////////////
-
-int enter___syscall___sync(struct pt_regs *ctx) { return enter_common(ctx, __NR_sync); }
-
-int return___syscall___sync(struct pt_regs *ctx) { return return_common(ctx); }
-
-////////////////////////////////////////////////////////////////////////////////
-
-int enter___syscall___syncfs(struct pt_regs *ctx, int fd) {
-  return enter_common(ctx, __NR_syncfs);
-}
-
-int return___syscall___syncfs(struct pt_regs *ctx) { return return_common(ctx); }
-
-////////////////////////////////////////////////////////////////////////////////
-
-int enter___syscall___fsync(struct pt_regs *ctx, unsigned int fd) {
-  return enter_common(ctx, __NR_fsync);
-}
-
-int enter___syscall___fdatasync(struct pt_regs *ctx, unsigned int fd) {
-  return enter_common(ctx, __NR_fdatasync);
-}
-
-int return___syscall___fsync(struct pt_regs *ctx) { return return_common(ctx); }
-int return___syscall___fdatasync(struct pt_regs *ctx) { return return_common(ctx); }
-
-////////////////////////////////////////////////////////////////////////////////
-
-int enter___syscall___truncate(struct pt_regs *ctx, const char __user *path,
-                               long length) {
-  return enter_common(ctx, __NR_truncate);
-}
-
-int return___syscall___truncate(struct pt_regs *ctx) { return return_common(ctx); }
-
-////////////////////////////////////////////////////////////////////////////////
-
-int enter___syscall___link(struct pt_regs *ctx, const char __user *oldname,
-                           const char __user *newname) {
-  return enter_common(ctx, __NR_link);
-}
-
-int enter___syscall___linkat(struct pt_regs *ctx, int olddfd, const char __user *oldname,
-                             int newdfd, const char __user *newname, int flags) {
-  return enter_common(ctx, __NR_linkat);
-}
-
-int return___syscall___link(struct pt_regs *ctx) { return return_common(ctx); }
-int return___syscall___linkat(struct pt_regs *ctx) { return return_common(ctx); }
-
-////////////////////////////////////////////////////////////////////////////////
-
-int enter___syscall___symlink(struct pt_regs *ctx, const char __user *oldname,
-                              const char __user *newname) {
-  return enter_common(ctx, __NR_symlink);
-}
-
-int enter___syscall___symlinkat(struct pt_regs *ctx, int olddfd,
-                                const char __user *oldname, int newdfd,
-                                const char __user *newname, int flags) {
-  return enter_common(ctx, __NR_symlinkat);
-}
-
-int return___syscall___symlink(struct pt_regs *ctx) { return return_common(ctx); }
-int return___syscall___symlinkat(struct pt_regs *ctx) { return return_common(ctx); }
+SEC("fexit/__x64_sys_close")
+int BPF_PROG(syse_close, struct pt_regs *regs) { return submit_event(regs); }

@@ -1,3 +1,6 @@
+//go:build linux
+// +build linux
+
 package trace
 
 import (
@@ -5,141 +8,46 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"fmt"
-	"io/ioutil"
+	"errors"
+	"io"
+	"log"
 	"os"
+	"reflect"
 	"regexp"
 	"strconv"
-	"strings"
-	"unsafe"
 
-	"github.com/iovisor/gobpf/bcc"
-	"github.com/rakyll/statik/fs"
-
-	// Load static assets
-	_ "github.com/tarosky/gutenberg-phptrace/statik"
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/ringbuf"
+	"github.com/cilium/ebpf/rlimit"
 	"go.uber.org/zap"
+	"golang.org/x/sys/unix"
 )
 
-//go:generate statik -src=c
+// $BPF_CLANG and $BPF_CFLAGS are set by the Makefile.
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror -D__TARGET_ARCH_x86" -type event bpf ../c/trace.c -- -I../c/headers -I/usr/include/x86_64-linux-gnu
 
 var (
-	log             *zap.Logger
 	syscallHeaderRe = regexp.MustCompile(`#define\s+__NR_(\w+)\s+(\d+)`)
-)
-
-const (
-	cTaskCommLen = 16
-	cPathMax     = 4096
 )
 
 // Config configures parameters to filter what to be notified.
 type Config struct {
 	SyscallHeader string
-	BpfDebug      uint
 	Quit          bool
 	Log           *zap.Logger
 }
 
-func unpackSource(name string) string {
-	sfs, err := fs.New()
-	if err != nil {
-		log.Panic("embedded FS not found", zap.Error(err))
-	}
-
-	r, err := sfs.Open("/" + name)
-	if err != nil {
-		log.Panic("embedded file not found", zap.Error(err))
-	}
-	defer r.Close()
-
-	contents, err := ioutil.ReadAll(r)
-	if err != nil {
-		log.Panic("failed to read embedded file", zap.Error(err))
-	}
-
-	return string(contents)
-}
-
-var source string = unpackSource("trace.c")
-
-type eventCStruct struct {
-	Syscall   uint32
-	Debug     uint32
-	Pid       uint64
+// Event tells the details of notification.
+type Event struct {
+	Syscall   string
+	Pid       uint32
+	FD        int32
+	Ret       int32
 	StartTime uint64
 	EndTime   uint64
-	Comm      [cTaskCommLen]byte
-	Path      [cPathMax]byte
-}
-
-func configSyscallTrace(m *bcc.Module) error {
-	names := []string{
-		"chmod",
-		"chown",
-		"fchmod",
-		"fchmodat",
-		"fchown",
-		"fchownat",
-		"fdatasync",
-		"fsync",
-		"lchown",
-		"link",
-		"linkat",
-		"rename",
-		"renameat",
-		"renameat2",
-		"symlink",
-		"symlinkat",
-		"sync",
-		"syncfs",
-		"truncate",
-		"unlink",
-		"unlinkat",
-	}
-
-	for _, n := range names {
-		kprobe, err := m.LoadKprobe("enter___syscall___" + n)
-		if err != nil {
-			return err
-		}
-
-		if err := m.AttachKprobe(bcc.GetSyscallFnName(n), kprobe, -1); err != nil {
-			return err
-		}
-
-		kretprobe, err := m.LoadKprobe("return___syscall___" + n)
-		if err != nil {
-			return err
-		}
-
-		if err := m.AttachKretprobe(bcc.GetSyscallFnName(n), kretprobe, -1); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func configTrace(m *bcc.Module, receiverChan chan []byte) *bcc.PerfMap {
-	if err := configSyscallTrace(m); err != nil {
-		log.Panic("failed to config syscall trace", zap.Error(err))
-	}
-
-	table := bcc.NewTable(m.TableId("events"), m)
-
-	perfMap, err := bcc.InitPerfMap(table, receiverChan, nil)
-	if err != nil {
-		log.Panic("Failed to init perf map", zap.Error(err))
-	}
-
-	return perfMap
-}
-
-func generateSource(config *Config) string {
-	r := strings.NewReplacer()
-
-	return r.Replace(source)
+	Comm      string
+	Path      string
 }
 
 func parseSyscallHeader(headerFile string) map[uint32]string {
@@ -164,73 +72,88 @@ func parseSyscallHeader(headerFile string) map[uint32]string {
 	return hMap
 }
 
-// Event tells the details of notification.
-type Event struct {
-	Syscall string
-	Pid     uint32
-	Comm    string
-}
-
-// Run starts compiling eBPF code and then notifying of file updates.
 func Run(ctx context.Context, config *Config, eventCh chan<- *Event) {
-	log = config.Log
-	m := bcc.NewModule(generateSource(config), []string{}, config.BpfDebug)
-	defer m.Close()
+	// Allow the current process to lock memory for eBPF resources.
+	if err := rlimit.RemoveMemlock(); err != nil {
+		log.Fatal(err)
+	}
 
 	syscallMap := parseSyscallHeader(config.SyscallHeader)
 
-	if config.Quit {
-		close(eventCh)
-		return
-	}
-
-	channel := make(chan []byte, 8192)
-	perfMap := configTrace(m, channel)
-
-	go func() {
-		log.Info("tracing started")
-		for {
-			select {
-			case <-ctx.Done():
-				close(eventCh)
-				return
-			case data := <-channel:
-				var cEvent eventCStruct
-				if err := binary.Read(bytes.NewBuffer(data), bcc.GetHostByteOrder(), &cEvent); err != nil {
-					fmt.Printf("failed to decode received data: %s\n", err)
-					continue
-				}
-
-				syscall, ok := syscallMap[cEvent.Syscall]
-				if !ok {
-					syscall = strconv.Itoa(int(cEvent.Syscall))
-				}
-				pid := uint32(cEvent.Pid)
-				startTime := cEvent.StartTime
-				endTime := cEvent.EndTime
-				debug := cEvent.Debug
-				comm := cPointerToString(unsafe.Pointer(&cEvent.Comm))
-
-				log.Debug(
-					"event",
-					zap.String("syscall", syscall),
-					zap.Uint32("pid", pid),
-					zap.Uint64("starttime", startTime),
-					zap.Uint64("endtime", endTime),
-					zap.String("comm", comm),
-					zap.Uint32("debug", debug),
-				)
-
-				eventCh <- &Event{
-					Syscall: syscall,
-					Comm:    comm,
-					Pid:     pid,
-				}
+	resources := []io.Closer{}
+	defer func() {
+		for _, r := range resources {
+			if err := r.Close(); err != nil {
+				log.Fatal(err)
 			}
 		}
 	}()
 
-	perfMap.Start()
-	<-ctx.Done()
-	perfMap.Stop()
+	objs := bpfObjects{}
+	if err := loadBpfObjects(&objs, nil); err != nil {
+		log.Fatalf("loading objects: %v", err)
+	}
+	resources = append(resources, &objs)
+
+	// Attach all fentry/fexit functions using reflection.
+	fentV := reflect.ValueOf(objs.bpfPrograms)
+	for i := 0; i < fentV.NumField(); i++ {
+		p := fentV.Field(i).Interface().(*ebpf.Program)
+
+		t, err := link.AttachTracing(link.TracingOptions{Program: p})
+		if err != nil {
+			log.Fatalf("opening fentry/fexit: %s", err)
+		}
+		resources = append(resources, t)
+	}
+
+	rd, err := ringbuf.NewReader(objs.Events)
+	if err != nil {
+		log.Fatalf("opening ringbuf reader: %s", err)
+	}
+
+	go func() {
+		<-ctx.Done()
+
+		if err := rd.Close(); err != nil {
+			log.Fatalf("closing ringbuf reader: %s", err)
+		}
+	}()
+
+	log.Println("Waiting for events..")
+
+	var event bpfEvent
+	for {
+		record, err := rd.Read()
+		if err != nil {
+			if errors.Is(err, ringbuf.ErrClosed) {
+				close(eventCh)
+				return
+			}
+			log.Printf("reading from reader: %s", err)
+			continue
+		}
+
+		// Parse the ringbuf event entry into a bpfEvent structure.
+		if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.LittleEndian, &event); err != nil {
+			log.Printf("parsing ringbuf event: %s", err)
+			continue
+		}
+
+		syscall, ok := syscallMap[event.Syscall]
+		if !ok {
+			syscall = strconv.Itoa(int(event.Syscall))
+		}
+
+		eventCh <- &Event{
+			Syscall:   syscall,
+			Pid:       event.Pid,
+			FD:        event.Fd,
+			Ret:       event.Ret,
+			StartTime: event.StartTime,
+			EndTime:   event.EndTime,
+			Comm:      unix.ByteSliceToString(event.Comm[:]),
+			Path:      unix.ByteSliceToString(event.Path[:]),
+		}
+	}
 }
